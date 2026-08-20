@@ -29,8 +29,8 @@ Pathologist annotations were derived from an adjacent H&E section (not the exact
 | `01` | QC filtering and normalization | `GIN{XX}_filtered_normalized.h5ad` |
 | `02a` | Clustering (Leiden / Louvain / GraphST) | `GIN{XX}_louvain_leiden_graphst.h5ad` |
 | `02b` | Clustering (BayesSpace) | `GIN{XX}_bayesspace.h5ad` |
-| `03` | Tumor purity estimation (ESTIMATE) | `GIN{XX}_estimate.h5ad` |
-| `04` | Copy number inference (InferCNV) | `GIN{XX}_infercnv.h5ad` |
+| `03` | Stromal/tumor estimation (ESTIMATE) | `GIN{XX}_estimate.h5ad` |
+| `04` | Copy number variation (InferCNV) | `GIN{XX}_infercnv.h5ad` |
 | `05` | Cell type deconvolution (cell2location) | `GIN{XX}_cell2location.h5ad` |
 | `06` | Cell-cell communication (CellChat) | Interaction networks (no h5ad output) |
 
