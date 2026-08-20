@@ -90,7 +90,7 @@ Raw sequencing data, Space Ranger outputs, and pathologist annotations are not i
 
 ## Authors and supervision
 
-- **Irati Martínez** — TFM student, CIMA / Universidad de Navarra
+- **Irati Martínez Les** — TFM student, CIMA / Universidad de Navarra
 - **Dra. Sandra Hervás Stubbs** — Primary thesis supervisor
 - **Dr. Ángel Mario Martínez Montes** — Co-supervisor
 
