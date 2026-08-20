@@ -64,7 +64,7 @@ Each script reads the h5ad produced by the previous step and writes a new, disti
 - Python and R, managed through a single conda environment (`spatial_analysis`)
 - Key Python packages: `scanpy`, `squidpy`, `GraphST`, `cell2location` (scvi-tools)
 - Key R packages: `BayesSpace`, `ESTIMATE`, `infercnv`, `CellChat`, `zellkonverter`
-- GPU recommended for `cell2location` (script 05)
+- GPU recommended
 - Developed and tested on a local workstation (ThinkStation P5) and the UNAV HPC cluster (Slurm)
 
 ```bash
@@ -76,13 +76,6 @@ conda activate spatial_analysis
 
 Scripts are numbered and intended to be run in order, from `00` through `06`. Each notebook/`.qmd` file expects the h5ad produced by the previous step as input; paths are configured at the top of each script.
 <img width="2387" height="1075" alt="ImagenesTFM (1)" src="https://github.com/user-attachments/assets/e68d45c4-ddea-4a27-8e20-c7a76ba26262" />
-
-
-## Known limitations
-
-- **Genome build check pending**: the InferCNV gene order file is labeled hg19 while the rest of the pipeline uses hg38; this needs to be resolved before any karyotype/cytoband analysis.
-- **BayesSpace** runs require 50,000 MCMC iterations for stable results (increased from the package default).
-- `TumorPurity` from ESTIMATE is a proxy value derived from a normalized `ESTIMATEScore`, not the original Affymetrix cosine-based metric (which is not valid for spatial RNA-seq data).
 
 ## Data availability
 
