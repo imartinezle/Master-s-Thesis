@@ -1,4 +1,3 @@
-# Master-s-Thesis
 # HGSOC Spatial Transcriptomics Pipeline
 
 Reproducible spatial transcriptomics analysis pipeline applied to high-grade serous ovarian carcinoma (HGSOC) samples, developed as part of a Master's thesis (TFM) in Bioinformatics at CIMA / Universidad de Navarra, within the PITAGORAS project.
