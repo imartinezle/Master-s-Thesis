@@ -1,0 +1,26 @@
+#!/bin/bash
+#SBATCH --job-name=Spaceranger_GIN67
+#SBATCH --output=/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/RESULTADOS/Spaceranger_GEX_GIN67.out
+#SBATCH --error=/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/RESULTADOS/Spaceranger_GEX_GIN67.err
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
+#SBATCH --partition=short
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=imartinezle@alumni.unav.es
+
+
+module load SpaceRanger
+
+
+spaceranger count \
+    --id="GIN67" \
+    --transcriptome="/home/imartinezle/Referencias/refdata-gex-GRCh38-2024-A" \
+    --image="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/GIN67_3T_2.tif" \
+    --slide=V14M06-322 \
+    --area="C1" \
+    --fastqs="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/GIN67" \
+    --sample="GIN-67-3T-2" \
+    --loupe-alignment="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/LoopBrowserEnric/GIN-67-3T-2/V14M06-322-C1_reviewed.json" \
+    --create-bam=true \
+    --output-dir="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/RESULTADOS/GIN67"
