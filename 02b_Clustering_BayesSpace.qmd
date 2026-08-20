@@ -1,0 +1,194 @@
+---
+title: "Clustering espacial — BayesSpace — `r params$sample_name`"
+format:
+  html:
+    embed-resources: true
+---
+
+Cuarto método de clustering, complementario a Leiden, Louvain y GraphST (notebook 02a). BayesSpace usa un modelo bayesiano (Potts prior) que incorpora la posición espacial de los spots.
+
+Lee el h5ad generado en 02a y le añade la columna `BayesSpace_k7`, sin tocar las columnas de clustering que ya trae (`Leiden`, `Louvain`, `GraphST`).
+
+**Input:** `h5ad_outputs/{sample_name}_louvain_leiden_graphst.h5ad`
+
+**Output:** `h5ad_outputs/{sample_name}_bayesspace.h5ad`
+
+```{r setup}
+# cambiar sample_name para procesar otra muestra
+# sample_name <- "GIN63"
+# sample_name <- "GIN65"
+# sample_name <- "GIN67"
+sample_name <- "GIN71"
+
+cat(sprintf("Procesando paciente: %s\n", sample_name))
+```
+
+## Librerías
+
+```{r}
+library(BayesSpace)
+library(zellkonverter)
+library(SingleCellExperiment)
+library(ggplot2)
+library(mclust)
+
+set.seed(42)
+```
+
+## Rutas
+
+```{r}
+H5AD_DIR <- "/home/imartinezle/h5ad_outputs"
+FIG_DIR  <- sprintf("/home/imartinezle/Figuras/figuras_%s/BayesSpace/", sample_name)
+
+INPUT_FILE  <- file.path(H5AD_DIR, paste0(sample_name, "_louvain_leiden_graphst.h5ad"))
+OUTPUT_FILE <- file.path(H5AD_DIR, paste0(sample_name, "_bayesspace.h5ad"))
+
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(H5AD_DIR, showWarnings = FALSE, recursive = TRUE)
+
+cat(sprintf("Input:  %s\n", INPUT_FILE))
+cat(sprintf("Output: %s\n", OUTPUT_FILE))
+```
+
+## Cargar datos
+
+```{r}
+sce <- readH5AD(INPUT_FILE)
+
+cat(sprintf("Spots: %d\n", ncol(sce)))
+cat(sprintf("Genes: %d\n", nrow(sce)))
+print(table(sce$Layer_patologo))
+```
+
+## Coordenadas espaciales
+
+BayesSpace necesita columnas `row`/`col` en `colData`; en el h5ad las coordenadas vienen en `obsm['spatial']`, que zellkonverter guarda como `reducedDim(sce, "spatial")`.
+
+```{r}
+if ("spatial" %in% names(reducedDims(sce))) {
+  coords <- reducedDim(sce, "spatial")
+  colData(sce)$row <- coords[, 2]   # imagerow
+  colData(sce)$col <- coords[, 1]   # imagecol
+} else if (!is.null(colData(sce)$array_row)) {
+  colData(sce)$row <- colData(sce)$array_row
+  colData(sce)$col <- colData(sce)$array_col
+} else {
+  stop("No se encontraron coordenadas espaciales. Comprueba adata.obsm en Python.")
+}
+
+cat(sprintf("Rango row: [%.0f, %.0f]\n", min(sce$row), max(sce$row)))
+cat(sprintf("Rango col: [%.0f, %.0f]\n", min(sce$col), max(sce$col)))
+```
+
+## Asegurar el assay 'counts'
+
+```{r}
+cat("Assays disponibles:", assayNames(sce), "\n")
+
+if (!"counts" %in% assayNames(sce)) {
+  if ("X" %in% assayNames(sce)) {
+    assayNames(sce)[assayNames(sce) == "X"] <- "counts"
+  } else if ("logcounts" %in% assayNames(sce)) {
+    assay(sce, "counts") <- assay(sce, "logcounts")
+  }
+}
+stopifnot("counts" %in% assayNames(sce))
+```
+
+## Preprocesamiento
+
+```{r}
+sce <- spatialPreprocess(
+  sce,
+  platform      = "Visium",
+  n.PCs         = 15,
+  n.HVGs        = 2000,
+  log.normalize = TRUE,
+  skip.PCA      = FALSE
+)
+```
+
+## Número de clusters
+
+`qTune` se dejó corrido en su momento y el codo no era muy pronunciado; se optó por fijar q=7 para las 4 muestras, el mismo valor usado en Leiden y GraphST (notebook 02a), para poder comparar los cuatro métodos con la misma granularidad. El código de `qTune` se deja comentado por si se quiere repetir la exploración con otra muestra.
+
+```{r}
+# sce <- qTune(sce, qs = seq(2, 10), platform = "Visium", d = 15)
+# qPlot(sce) + geom_vline(xintercept = 7, linetype = "dashed", color = "red")
+# ggsave(file.path(FIG_DIR, "qtune_elbow.png"), width = 8, height = 5, dpi = 150)
+```
+
+```{r}
+N_CLUSTERS <- 7
+
+sce_q7 <- spatialCluster(
+  sce,
+  q           = N_CLUSTERS,
+  platform    = "Visium",
+  d           = 15,
+  init.method = "mclust",
+  model       = "t",
+  gamma       = 2,
+  nrep        = 10000,   # subir a 50000 para resultados finales de la memoria
+  burn.in     = 1000
+)
+
+sce$BayesSpace_k7 <- sce_q7$spatial.cluster
+print(table(sce$BayesSpace_k7))
+```
+
+## Visualización
+
+```{r}
+colData(sce)$pxl_row_in_fullres <- colData(sce)$row
+colData(sce)$pxl_col_in_fullres <- colData(sce)$col
+
+p_k7 <- clusterPlot(sce, label = "BayesSpace_k7", size = 0.5) +
+  ggtitle(sprintf("BayesSpace clusters (%s)", sample_name)) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+
+ggsave(file.path(FIG_DIR, paste0("bayesspace_clusters_", sample_name, ".png")),
+       p_k7, width = 8, height = 8, dpi = 150)
+print(p_k7)
+```
+
+## Comparación con la anotación del patólogo
+
+Chequeo de coherencia, no una métrica de validación formal (`Layer_patologo` viene de un corte de H&E adyacente, no es ground truth exacto — ver limitación detallada en el script de ESTIMATE).
+
+```{r}
+mask_annot <- sce$Layer_patologo != "unannotated"
+ari_val <- adjustedRandIndex(sce$BayesSpace_k7[mask_annot], sce$Layer_patologo[mask_annot])
+cat(sprintf("ARI BayesSpace vs patólogo = %.4f\n", ari_val))
+
+contingencia <- table(BayesSpace = sce$BayesSpace_k7, Patologo = sce$Layer_patologo)
+print(contingencia)
+
+cont_df <- as.data.frame(contingencia)
+p_cont <- ggplot(cont_df, aes(x = Patologo, y = as.factor(BayesSpace), fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", fontface = "bold") +
+  scale_fill_gradient(low = "#3182bd", high = "#08519c") +
+  labs(title = sprintf("BayesSpace vs pathologist (ARI=%.3f) — %s", ari_val, sample_name),
+       x = "Pathologist region", y = "BayesSpace cluster", fill = "N spots") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave(file.path(FIG_DIR, paste0("bayesspace_vs_patologo_", sample_name, ".png")),
+       p_cont, width = 8, height = 6, dpi = 150)
+print(p_cont)
+```
+
+## Guardar objeto
+
+`BayesSpace_k7` queda como columna en `colData`, junto a `Leiden`, `Louvain` y `GraphST` que ya venían del notebook 02a — no hace falta exportar un CSV aparte, todo viaja en el mismo h5ad.
+
+```{r}
+writeH5AD(sce, OUTPUT_FILE)
+
+cat(sprintf("Objeto guardado en: %s\n", OUTPUT_FILE))
+cat(sprintf("Spots: %d\n", ncol(sce)))
+cat(sprintf("ARI BayesSpace vs patólogo: %.4f\n", ari_val))
+```
