@@ -77,14 +77,7 @@ conda activate spatial_analysis
 
 Scripts are numbered and intended to be run in order, from `00` through `06`. Each notebook/`.qmd` file expects the h5ad produced by the previous step as input; paths are configured at the top of each script.
 
-[TFM.docx](https://github.com/user-attachments/files/31261148/TFM.docx)
-<img width="2500" height="1406" alt="ImagenesTFM (5)" src="https://github.com/user-attachments/assets/c0bc08d1-cddc-444b-91b1-9eb4783f5dc5" />
-<img width="2500" height="1406" alt="ImagenesTFM (6)" src="https://github.com/user-attachments/assets/467913bd-6078-4adc-af74-cf3562014869" />
-[TFM_AMM.pdf](https://github.com/user-attachments/files/31261147/TFM_AMM.pdf)
-[TFM.pdf](https://github.com/user-attachments/files/31261145/TFM.pdf)
-<img width="2500" height="1406" alt="ImagenesTFM (2)" src="https://github.com/user-attachments/assets/abac269b-c544-4aea-bac5-9f3751c51f90" />
-<img width="2500" height="1406" alt="ImagenesTFM (1)" src="https://github.com/user-attachments/assets/7fd33ef2-da86-4db2-b59a-9570179f1a7c" />
-
+<img width="2500" height="1406" alt="ImagenesTFM (1)" src="https://github.com/user-attachments/assets/f82e8eaa-24f0-4974-be8b-07c0e815d555" />
 
 ## Known limitations
 
