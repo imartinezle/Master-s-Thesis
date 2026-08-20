@@ -77,27 +77,24 @@ conda activate spatial_analysis
 
 Scripts are numbered and intended to be run in order, from `00` through `06`. Each notebook/`.qmd` file expects the h5ad produced by the previous step as input; paths are configured at the top of each script.
 
-```bash
-# Example: run script 01 for a given sample
-jupyter nbconvert --to notebook --execute Scripts/01_Filtrado_normalizado.ipynb
-```
+[TFM.docx](https://github.com/user-attachments/files/31261148/TFM.docx)
+<img width="2500" height="1406" alt="ImagenesTFM (5)" src="https://github.com/user-attachments/assets/c0bc08d1-cddc-444b-91b1-9eb4783f5dc5" />
+<img width="2500" height="1406" alt="ImagenesTFM (6)" src="https://github.com/user-attachments/assets/467913bd-6078-4adc-af74-cf3562014869" />
+[TFM_AMM.pdf](https://github.com/user-attachments/files/31261147/TFM_AMM.pdf)
+[TFM.pdf](https://github.com/user-attachments/files/31261145/TFM.pdf)
+<img width="2500" height="1406" alt="ImagenesTFM (2)" src="https://github.com/user-attachments/assets/abac269b-c544-4aea-bac5-9f3751c51f90" />
+<img width="2500" height="1406" alt="ImagenesTFM (1)" src="https://github.com/user-attachments/assets/7fd33ef2-da86-4db2-b59a-9570179f1a7c" />
 
-R scripts (`.qmd`) can be rendered with Quarto:
-
-```bash
-quarto render Scripts/03_ESTIMATE.qmd
-```
 
 ## Known limitations
 
 - **Genome build check pending**: the InferCNV gene order file is labeled hg19 while the rest of the pipeline uses hg38; this needs to be resolved before any karyotype/cytoband analysis.
 - **BayesSpace** runs require 50,000 MCMC iterations for stable results (increased from the package default).
-- **CellChat**: `cellchat@data.signaling` currently returns `NULL` after `subsetData()` in CellChat v2.2.0.9001; under investigation.
 - `TumorPurity` from ESTIMATE is a proxy value derived from a normalized `ESTIMATEScore`, not the original Affymetrix cosine-based metric (which is not valid for spatial RNA-seq data).
 
 ## Data availability
 
-Raw sequencing data, Space Ranger outputs, and pathologist annotations are not included in this repository due to patient data privacy. Processed/intermediate `.h5ad` files are also excluded (see `.gitignore`). [Adjust this section depending on whether/where raw data will be deposited, e.g. GEO/EGA accession.]
+Raw sequencing data, Space Ranger outputs, and pathologist annotations are not included in this repository due to patient data privacy. Processed/intermediate `.h5ad` files are also excluded.
 
 ## Authors and supervision
 
@@ -108,7 +105,3 @@ Raw sequencing data, Space Ranger outputs, and pathologist annotations are not i
 ## Acknowledgments
 
 This work was developed within the PITAGORAS project at CIMA, Universidad de Navarra.
-
-## License
-
-[Choose a license, e.g. MIT — see step-by-step guide]
