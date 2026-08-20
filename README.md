@@ -76,8 +76,8 @@ conda activate spatial_analysis
 ## Usage
 
 Scripts are numbered and intended to be run in order, from `00` through `06`. Each notebook/`.qmd` file expects the h5ad produced by the previous step as input; paths are configured at the top of each script.
+<img width="2387" height="1075" alt="ImagenesTFM (1)" src="https://github.com/user-attachments/assets/e68d45c4-ddea-4a27-8e20-c7a76ba26262" />
 
-<img width="2500" height="1406" alt="ImagenesTFM (1)" src="https://github.com/user-attachments/assets/f82e8eaa-24f0-4974-be8b-07c0e815d555" />
 
 ## Known limitations
 
