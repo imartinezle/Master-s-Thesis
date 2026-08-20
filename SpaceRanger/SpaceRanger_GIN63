@@ -21,6 +21,6 @@ spaceranger count \
     --area="A1" \
     --fastqs="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/GIN63" \
     --sample="GIN-63-3T-4" \
-    --loupe-alignment="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/LoopBrowserEnric/GIN-63-3T-4/V14M06-322-D1_reviewed.json" \
+    --loupe-alignment="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/LoopBrowserEnric/GIN-63-3T-4/V14M06-322-A1_reviewed.json" \
     --create-bam=true \
     --output-dir="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/RESULTADOS/GIN63"
