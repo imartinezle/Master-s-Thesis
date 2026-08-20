@@ -16,11 +16,11 @@ module load SpaceRanger
 spaceranger count \
     --id="GIN63" \
     --transcriptome="/home/imartinezle/Referencias/refdata-gex-GRCh38-2024-A" \
-    --image="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/GIN63_3T_1.tif" \
+    --image="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/GIN63_3T_4.tif" \
     --slide=V14M06-322 \
     --area="A1" \
     --fastqs="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/GIN63" \
-    --sample="GIN-63-3T-1" \
-    --loupe-alignment="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/LoopBrowserEnric/GIN-63-3T-1/V14M06-322-D1_reviewed.json" \
+    --sample="GIN-63-3T-4" \
+    --loupe-alignment="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/LoopBrowserEnric/GIN-63-3T-4/V14M06-322-D1_reviewed.json" \
     --create-bam=true \
     --output-dir="/home/imartinezle/spatial_transcriptomics/Spatial_Transcriptomics_Analysis/RESULTADOS/GIN63"
