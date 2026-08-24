@@ -425,5 +425,3 @@ write.csv(resumen, file.path(WORK_DIR, paste0(sample_name, "_summary.csv")), row
 knitr::kable(resumen)
 ```
 
--   Para las 4 muestras, cambiar `sample_name` en el chunk de configuración y
-    volver a correr — no hace falta tocar nada más del script.
