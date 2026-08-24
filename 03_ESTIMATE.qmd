@@ -1,0 +1,528 @@
+---
+title: "ESTIMATE"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+ESTIMATE infiere, a partir de la expresión, la proporción de células estromales, inmunes y tumorales en cada spot:
+
+-   `StromalScore`: presencia de células estromales
+-   `ImmuneScore`: presencia de células inmunes
+-   `ESTIMATEScore`: combinación de ambos
+-   `TumorPurity`: proxy normalizado (NO la fórmula Affymetrix clásica, que no es válida para RNA-seq/espacial — ver nota metodológica al final)
+
+Con `StromalScore` se calcula además el umbral de "estroma puro" que sirve de background/referencia normal para InferCNV (script 04).
+
+**Input:** `h5ad_outputs/{sample_name}_bayesspace.h5ad`
+
+**Output:** `h5ad_outputs/{sample_name}_estimate.h5ad`
+
+```{r setup}
+# cambiar sample_name para procesar otra muestra
+# sample_name <- "GIN63"
+# sample_name <- "GIN65"
+# sample_name <- "GIN67"
+sample_name <- "GIN71"
+
+cat(sprintf("Procesando paciente: %s\n", sample_name))
+```
+
+**Muestra actual: `r sample_name`**
+
+## Librerías
+
+```{r}
+library(zellkonverter)
+library(SingleCellExperiment)
+library(mclust)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(ggforce)
+library(estimate)
+library(RANN)
+
+set.seed(42)
+```
+
+## Rutas
+
+Los archivos intermedios que exige el propio paquete `estimate` (necesita rutas de fichero, no puede trabajar solo en memoria) se guardan en una carpeta de trabajo aparte; no forman parte del pipeline de h5ad.
+
+```{r}
+H5AD_DIR <- "/home/imartinezle/h5ad_outputs/"
+FIG_DIR  <- sprintf("/home/imartinezle/Figuras/figuras_%s/ESTIMATE/", sample_name)
+WORK_DIR <- sprintf("/home/imartinezle/Resultados_R/%s/ESTIMATE_intermedios/", sample_name)
+
+INPUT_FILE  <- file.path(H5AD_DIR, paste0(sample_name, "_bayesspace.h5ad"))
+OUTPUT_FILE <- file.path(H5AD_DIR, paste0(sample_name, "_estimate.h5ad"))
+
+TXT_FILE      <- file.path(WORK_DIR, paste0(sample_name, "_expression.txt"))
+FILTERED_FILE <- file.path(WORK_DIR, paste0(sample_name, "_expression_filtered.gct"))
+ESTIMATE_FILE <- file.path(WORK_DIR, paste0(sample_name, "_estimate_score.gct"))
+
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(WORK_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(H5AD_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Cargar datos
+
+```{r}
+sce <- readH5AD(INPUT_FILE)
+
+cat(sprintf("Spots: %d\n", ncol(sce)))
+cat(sprintf("Genes: %d\n", nrow(sce)))
+print(table(sce$Layer_patologo))
+
+# ESTIMATE se calcula sobre el objeto completo (incluye unannotated); el resto
+# de este script usa la versión filtrada
+sce_full <- sce
+sce <- sce[, sce$Layer_patologo != "unannotated"]
+
+cat(sprintf("Spots tras filtrar unannotated: %d (de %d totales)\n", ncol(sce), ncol(sce_full)))
+```
+
+## Preparar matriz de expresión
+
+```{r}
+expr_matrix <- as.matrix(assay(sce, "X"))   # normalizado, viene del notebook 01/02a
+cat(sprintf("Matriz de expresión inicial: %d genes x %d spots\n", nrow(expr_matrix), ncol(expr_matrix)))
+
+# ESTIMATE exige índices de gen únicos; con genes duplicados nos quedamos con
+# la fila de mayor expresión media
+genes_dup <- rownames(expr_matrix)[duplicated(rownames(expr_matrix))]
+cat(sprintf("Genes duplicados encontrados: %d\n", length(unique(genes_dup))))
+
+if (length(genes_dup) > 0) {
+  expr_df_dedup <- as.data.frame(expr_matrix)
+  expr_df_dedup$gene <- rownames(expr_df_dedup)
+  expr_df_dedup$mean_expr <- rowMeans(expr_matrix)
+  expr_df_dedup <- expr_df_dedup[order(-expr_df_dedup$mean_expr), ]
+  expr_df_dedup <- expr_df_dedup[!duplicated(expr_df_dedup$gene), ]
+  rownames(expr_df_dedup) <- expr_df_dedup$gene
+  expr_df_dedup$gene <- NULL
+  expr_df_dedup$mean_expr <- NULL
+  expr_matrix <- as.matrix(expr_df_dedup)
+  cat(sprintf("Matriz tras deduplicar: %d genes\n", nrow(expr_matrix)))
+}
+```
+
+## Calcular ESTIMATE score
+
+```{r}
+expr_df <- data.frame(NAME = rownames(expr_matrix), expr_matrix, check.names = FALSE)
+write.table(expr_df, TXT_FILE, sep = "\t", quote = FALSE, row.names = FALSE)
+
+filterCommonGenes(input.f = TXT_FILE, output.f = FILTERED_FILE, id = "GeneSymbol")
+estimateScore(input.ds = FILTERED_FILE, output.ds = ESTIMATE_FILE, platform = "illumina")
+cat("ESTIMATE score calculado\n")
+```
+
+## Añadir scores al objeto
+
+```{r}
+estimate_scores <- read.table(ESTIMATE_FILE, skip = 2, header = TRUE, row.names = 1,
+                               sep = "\t", check.names = FALSE)
+estimate_scores <- estimate_scores[, -1]  # quitar columna "Description"
+estimate_scores_t <- as.data.frame(t(estimate_scores))
+rownames(estimate_scores_t) <- gsub("\\.", "-", rownames(estimate_scores_t))
+
+barcodes_comunes <- intersect(colnames(sce), rownames(estimate_scores_t))
+cat(sprintf("Barcodes coincidentes: %d / %d\n", length(barcodes_comunes), ncol(sce)))
+if (length(barcodes_comunes) == 0) {
+  stop("No hay barcodes coincidentes. Revisa si ESTIMATE alteró los nombres (guiones/puntos).")
+}
+
+sce <- sce[, barcodes_comunes]
+sce$StromalScore  <- estimate_scores_t[colnames(sce), "StromalScore"]
+sce$ImmuneScore   <- estimate_scores_t[colnames(sce), "ImmuneScore"]
+sce$ESTIMATEScore <- estimate_scores_t[colnames(sce), "ESTIMATEScore"]
+
+cat(sprintf("NAs en ESTIMATEScore: %d / %d\n", sum(is.na(sce$ESTIMATEScore)), length(sce$ESTIMATEScore)))
+```
+
+## Tumor purity (proxy)
+
+La fórmula clásica de Affymetrix (`cos(0.6049872018 + 0.0001467884 * ESTIMATEScore)`) solo es válida para microarrays. Para RNA-seq/espacial se usa un proxy normalizado 0-1, invertido (1 = más puro/tumoral, ESTIMATEScore bajo).
+
+```{r}
+estimate_min <- min(sce$ESTIMATEScore, na.rm = TRUE)
+estimate_max <- max(sce$ESTIMATEScore, na.rm = TRUE)
+sce$TumorPurity <- 1 - (sce$ESTIMATEScore - estimate_min) / (estimate_max - estimate_min)
+
+print(summary(data.frame(
+  StromalScore = sce$StromalScore, ImmuneScore = sce$ImmuneScore,
+  ESTIMATEScore = sce$ESTIMATEScore, TumorPurity = sce$TumorPurity
+)))
+```
+
+## Datos para las figuras
+
+`plot_df` y la paleta del patólogo se usan en todas las figuras de aquí en
+adelante, se definen una sola vez.
+
+```{r}
+palette_patologo <- c(
+  "tumor" = "#D85A30", "stroma" = "#1D9E75",
+  "stroma_linfos" = "#534AB7", "unannotated" = "#B4B2A9"
+)
+
+plot_df <- data.frame(
+  x = sce$col, y = sce$row,
+  StromalScore = sce$StromalScore, ImmuneScore = sce$ImmuneScore,
+  ESTIMATEScore = sce$ESTIMATEScore, TumorPurity = sce$TumorPurity,
+  region_patologo = sce$Layer_patologo
+)
+
+# radio del hexagono a partir de la distancia minima entre spots vecinos,
+# para que el mosaico quede sin huecos ni solapes
+calc_hex_radius <- function(data, n_sample = 2000) {
+  set.seed(1)
+  idx <- sample(seq_len(nrow(data)), min(n_sample, nrow(data)))
+  d_mat <- as.matrix(dist(data[idx, c("x", "y")]))
+  diag(d_mat) <- Inf
+  min(apply(d_mat, 1, min)) / sqrt(3)
+}
+hex_radius <- calc_hex_radius(plot_df)
+```
+
+## Visualización espacial de los scores
+
+```{r}
+plot_spatial_score <- function(data, score_col, title, palette = "viridis") {
+  ggplot(data, aes(x0 = x, y0 = -y, fill = .data[[score_col]])) +
+    geom_regon(aes(sides = 6, angle = 0, r = hex_radius), color = NA) +
+    scale_fill_viridis_c(option = palette) +
+    coord_fixed() +
+    labs(title = title, fill = score_col) +
+    theme_void() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+}
+
+p_stromal  <- plot_spatial_score(plot_df, "StromalScore",  sprintf("Stromal Score — %s", sample_name))
+p_immune   <- plot_spatial_score(plot_df, "ImmuneScore",   sprintf("Immune Score — %s", sample_name))
+p_estimate <- plot_spatial_score(plot_df, "ESTIMATEScore", sprintf("ESTIMATE Score — %s", sample_name))
+p_purity   <- plot_spatial_score(plot_df, "TumorPurity",   sprintf("Tumor Purity (proxy) — %s", sample_name), palette = "magma")
+
+p_combined <- (p_stromal | p_immune) / (p_estimate | p_purity) +
+  plot_annotation(title = sprintf("ESTIMATE scores — %s", sample_name),
+                   theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14)))
+ggsave(file.path(FIG_DIR, paste0("estimate_scores_", sample_name, ".png")), p_combined, width = 12, height = 12, dpi = 150)
+print(p_combined)
+```
+
+El `StromalScore` es el que más se usa más adelante (umbral de background para InferCNV), así que se guarda también como figura independiente, no solo dentro del panel combinado.
+
+```{r}
+ggsave(file.path(FIG_DIR, paste0("stromal_score_", sample_name, ".png")), p_stromal, width = 7, height = 7, dpi = 150)
+print(p_stromal)
+```
+
+## Comparación con la anotación del patólogo
+
+```{r}
+boxplot_por_region <- function(data, score_col, ylab, title) {
+  ggplot(data, aes(x = region_patologo, y = .data[[score_col]], fill = region_patologo)) +
+    geom_boxplot() +
+    scale_fill_manual(values = palette_patologo) +
+    labs(title = title, x = "Pathologist region", y = ylab) +
+    theme_bw() + theme(legend.position = "none")
+}
+
+p_box_stromal  <- boxplot_por_region(plot_df, "StromalScore",  "Stromal Score",         sprintf("Stromal Score by pathologist region — %s", sample_name))
+p_box_patologo <- boxplot_por_region(plot_df, "ESTIMATEScore", "ESTIMATE Score",        sprintf("ESTIMATE Score by pathologist region — %s", sample_name))
+
+ggsave(file.path(FIG_DIR, paste0("stromal_score_boxplot_patologo_", sample_name, ".png")), p_box_stromal, width = 7, height = 5, dpi = 150)
+ggsave(file.path(FIG_DIR, paste0("estimate_boxplot_patologo_", sample_name, ".png")), p_box_patologo, width = 7, height = 5, dpi = 150)
+print(p_box_stromal)
+print(p_box_patologo)
+```
+
+## Umbral de StromalScore para background de InferCNV
+
+Objetivo: definir qué spots son "estroma puro" (background/referencia normal para InferCNV). Se comparan tres umbrales automáticos, calculados por percentil de contaminación tumoral objetivo (5% de tumor en GIN63/GIN67, 1% en GIN65/GIN71 para la referencia asimétrica; 5% y 1% uniformes para las otras dos), y se filtran además por vecindad espacial (un spot puede superar el umbral de score y aun así estar rodeado de spots tumorales, por solapamiento entre spots vecinos en Visium). Las tres quedan calculadas y guardadas en el h5ad; la decisión de cuál usar como referencia oficial se explica más abajo.
+
+```{r}
+regions_to_include <- c("tumor", "stroma")
+if ("stroma_linfos" %in% plot_df$region_patologo) regions_to_include <- c(regions_to_include, "stroma_linfos")
+df_threshold <- plot_df %>% filter(region_patologo %in% regions_to_include)
+
+cat(sprintf("Spots usados para calibrar el umbral (tumor+stroma): %d\n", nrow(df_threshold)))
+```
+
+### Umbral objetivo por paciente
+
+```{r}
+# umbral asimétrico por paciente (heurística acordada con Angel): 5% de
+# contaminación tumoral para GIN63/GIN67, 1% para GIN65/GIN71
+target_pct_por_paciente <- c(GIN63 = 5, GIN65 = 1, GIN67 = 5, GIN71 = 1)
+target_pct_asimetrico <- if (sample_name %in% names(target_pct_por_paciente)) {
+  target_pct_por_paciente[[sample_name]]
+} else {
+  5  # rescate generico si aparece una muestra nueva no contemplada en la tabla
+}
+cat(sprintf("Objetivo de contaminación tumoral para %s: %d%%\n", sample_name, target_pct_asimetrico))
+```
+
+### 1. Distribución de StromalScore
+
+```{r}
+p_dens_stromal <- ggplot(df_threshold, aes(x = StromalScore, fill = region_patologo)) +
+  geom_density(alpha = 0.5) +
+# Línea vertical discontinua negra
+  geom_vline(xintercept = target_pct_asimetrico, 
+             linetype = "dashed",     
+             linewidth = 0.5) +       
+  # Texto flotante dinámico
+  geom_text(aes(x = target_pct_asimetrico, y = Inf), 
+            label = sprintf("%d%%", target_pct_asimetrico),
+            hjust = -0.2,             # Mueve el texto ligeramente a la derecha de la línea
+            vjust = 1.5,              # Baja el texto para que no se corte con el borde superior
+            inherit.aes = FALSE) +    # Evita conflictos con el "fill" del ggplot principal
+  scale_fill_manual(values = palette_patologo) +
+  labs(title = sprintf("Stromal Score distribution — %s", sample_name),
+       x = "Stromal Score", y = "Density", fill = "Region") +
+  theme_bw()
+ggsave(file.path(FIG_DIR, paste0("stromal_score_distribution_", sample_name, ".png")), p_dens_stromal, width = 8, height = 5, dpi = 150)
+print(p_dens_stromal)
+```
+
+### 2. Composición del patólogo según el corte (barplot apilado, con % visibles)
+
+Para cada corte de `StromalScore` se calcula qué % de los spots que quedan
+por encima pertenecen a cada región del patólogo. Con un corte bajo entran
+tumor y estroma mezclados; a medida que sube el corte, el % de tumor debería
+bajar hasta quedar casi en cero. Los porcentajes se muestran dentro de cada
+segmento (se omiten los segmentos muy pequeños para no saturar el gráfico).
+Vista amplia primero, zoom en percentiles altos (P85-P99) después, que es
+donde suele estar el umbral bueno.
+
+```{r}
+calcular_composicion <- function(data, cortes) {
+  filas <- vector("list", length(cortes))
+  for (i in seq_along(cortes)) {
+    corte_i <- cortes[i]
+    sel <- data %>% filter(StromalScore > corte_i)
+    if (nrow(sel) == 0) {
+      filas[[i]] <- data.frame(region_patologo = NA, n = 0, pct = NA, corte = corte_i)
+    } else {
+      filas[[i]] <- sel %>% count(region_patologo, name = "n") %>%
+        mutate(pct = 100 * n / sum(n), corte = corte_i)
+    }
+  }
+  bind_rows(filas)
+}
+
+graficar_composicion <- function(comp_df, x_labels, title, xlab, min_pct_label = 4) {
+  comp_df$x_label <- factor(x_labels, levels = unique(x_labels))
+  comp_df$etiqueta <- ifelse(comp_df$pct >= min_pct_label, sprintf("%.0f%%", comp_df$pct), "")
+  ggplot(comp_df, aes(x = x_label, y = pct, fill = region_patologo)) +
+    geom_col(position = "stack") +
+    geom_text(aes(label = etiqueta), position = position_stack(vjust = 0.5), size = 2.8, color = "white") +
+    scale_fill_manual(values = palette_patologo) +
+    geom_hline(yintercept = target_pct_asimetrico, linetype = "dashed", color = "black", alpha = 0.6) +
+    labs(title = title, x = xlab, y = "% of spots (pathologist annotation)", fill = "Pathologist region") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# vista amplia: ~20 cortes equiespaciados en el rango completo de StromalScore
+ss_min <- floor(min(plot_df$StromalScore, na.rm = TRUE) / 50) * 50
+ss_max <- ceiling(max(plot_df$StromalScore, na.rm = TRUE) / 50) * 50
+paso_amplio <- round((ss_max - ss_min) / 19)
+cortes_amplio <- sort(unique(c(seq(0, ss_min, by = -paso_amplio), seq(0, ss_max, by = paso_amplio))))
+
+comp_amplio <- calcular_composicion(plot_df, cortes_amplio)
+p_barplot_amplio <- graficar_composicion(
+  comp_amplio, round(comp_amplio$corte, 1),
+  sprintf("Pathologist composition vs Stromal Score cutoff — %s (wide view)", sample_name),
+  "Stromal Score cutoff (spots with score > cutoff)"
+)
+ggsave(file.path(FIG_DIR, paste0("barplot_composicion_amplio_", sample_name, ".png")), p_barplot_amplio, width = 10, height = 6, dpi = 150)
+print(p_barplot_amplio)
+```
+
+```{r}
+percentiles_zoom <- seq(85, 99, by = 1)
+cortes_zoom_pct <- as.numeric(quantile(plot_df$StromalScore, probs = percentiles_zoom / 100, na.rm = TRUE))
+
+comp_zoom_pct <- calcular_composicion(plot_df, cortes_zoom_pct)
+pct_label_zoom <- paste0("P", percentiles_zoom[match(comp_zoom_pct$corte, cortes_zoom_pct)])
+
+p_barplot_zoom <- graficar_composicion(
+  comp_zoom_pct, pct_label_zoom,
+  sprintf("Pathologist composition vs Stromal Score percentile — %s (zoom P85-P99)", sample_name),
+  "Stromal Score percentile (spots with score > cutoff)"
+)
+ggsave(file.path(FIG_DIR, paste0("barplot_composicion_zoom_", sample_name, ".png")), p_barplot_zoom, width = 10, height = 6, dpi = 150)
+print(p_barplot_zoom)
+```
+
+### 3. Curva de contaminación tumoral y elección del umbral
+
+El barplot de arriba da una idea general, pero para ver exactamente **dónde**
+cae el corte elegido es más claro mirar la curva completa: % de tumor entre
+los spots retenidos, en función del corte de `StromalScore`. La línea
+horizontal marca el objetivo (5% o 1%, según el paciente) y la vertical marca
+el corte que efectivamente lo consigue — es el mismo criterio que usa
+`find_threshold_by_contamination` más abajo, aquí solo se visualiza.
+
+```{r}
+cortes_curva <- as.numeric(quantile(plot_df$StromalScore, probs = seq(0, 99.5, by = 0.5) / 100, na.rm = TRUE))
+
+curva_contaminacion <- calcular_composicion(plot_df, cortes_curva) %>%
+  filter(region_patologo == "tumor") %>%
+  select(corte, pct) %>%
+  tidyr::complete(corte = cortes_curva, fill = list(pct = 0))  # cortes sin tumor -> 0%, no NA
+```
+
+```{r}
+find_threshold_by_contamination <- function(target_pct, cortes, data) {
+  for (corte_i in cortes) {
+    sel <- data %>% filter(StromalScore > corte_i)
+    if (nrow(sel) == 0) break
+    pct_tumor <- 100 * sum(sel$region_patologo == "tumor", na.rm = TRUE) / nrow(sel)
+    if (pct_tumor < target_pct) return(corte_i)
+  }
+  as.numeric(quantile(data$StromalScore, probs = 0.95, na.rm = TRUE))  # rescate si no se alcanza el objetivo
+}
+
+umbral_A <- find_threshold_by_contamination(target_pct_asimetrico, cortes_curva, plot_df)  # asimetrica (oficial)
+umbral_B <- find_threshold_by_contamination(5, cortes_curva, plot_df)                       # uniforme 5%
+umbral_C <- find_threshold_by_contamination(1, cortes_curva, plot_df)                       # uniforme 1%
+
+cat(sprintf("Referencia A (asimétrica, %d%% tumor): threshold = %.3f\n", target_pct_asimetrico, umbral_A))
+cat(sprintf("Referencia B (uniforme 5%%):            threshold = %.3f\n", umbral_B))
+cat(sprintf("Referencia C (uniforme 1%%):            threshold = %.3f\n", umbral_C))
+```
+
+```{r}
+p_curva_contaminacion <- ggplot(curva_contaminacion, aes(x = corte, y = pct)) +
+  geom_line(color = "grey40") +
+  geom_point(size = 1.5, color = "grey40") +
+  geom_hline(yintercept = target_pct_asimetrico, linetype = "dashed", color = "#D85A30") +
+  geom_vline(xintercept = umbral_A, linetype = "dashed", color = "#1D9E75") +
+  annotate("point", x = umbral_A, y = target_pct_asimetrico, size = 3, color = "#1D9E75") +
+  labs(title = sprintf("Tumor contamination vs Stromal Score cutoff — %s", sample_name),
+       subtitle = sprintf("Target: %d%% tumor  |  Threshold chosen: %.1f", target_pct_asimetrico, umbral_A),
+       x = "Stromal Score cutoff", y = "% tumor among retained spots") +
+  theme_bw()
+
+ggsave(file.path(FIG_DIR, paste0("threshold_curve_", sample_name, ".png")), p_curva_contaminacion, width = 8, height = 5, dpi = 150)
+print(p_curva_contaminacion)
+```
+
+### 4. Filtro de vecindad espacial
+
+Un spot puede superar el umbral de `StromalScore` y aun así estar rodeado de
+spots tumorales, por solapamiento de señal entre spots vecinos en Visium. Se
+descartan los spots con más de `MAX_VECINOS_TUMOR` vecinos anotados como
+tumor entre sus k vecinos más próximos (kNN por coordenadas).
+
+```{r}
+contar_vecinos_tipo <- function(coords, labels, target_label, k = 6) {
+  nn <- RANN::nn2(data = coords, query = coords, k = k + 1)
+  vecinos_idx <- nn$nn.idx[, -1, drop = FALSE]
+  es_target <- matrix(labels[vecinos_idx] == target_label, nrow = nrow(vecinos_idx))
+  rowSums(es_target, na.rm = TRUE)
+}
+
+MAX_VECINOS_TUMOR <- 1
+coords_spot <- plot_df[, c("x", "y")]
+plot_df$vecinos_tumor <- contar_vecinos_tipo(coords_spot, as.character(plot_df$region_patologo), "tumor", k = 6)
+
+plot_df$ref_A_bruta  <- plot_df$StromalScore > umbral_A
+plot_df$ref_A_limpia <- plot_df$ref_A_bruta & (plot_df$vecinos_tumor <= MAX_VECINOS_TUMOR)
+
+plot_df$ref_B_bruta  <- plot_df$StromalScore > umbral_B
+plot_df$ref_B_limpia <- plot_df$ref_B_bruta & (plot_df$vecinos_tumor <= MAX_VECINOS_TUMOR)
+
+plot_df$ref_C_bruta  <- plot_df$StromalScore > umbral_C
+plot_df$ref_C_limpia <- plot_df$ref_C_bruta & (plot_df$vecinos_tumor <= MAX_VECINOS_TUMOR)
+
+cat(sprintf("Filtro de vecindad aplicado (k=6, máx %d vecino/s tumoral/es)\n", MAX_VECINOS_TUMOR))
+cat(sprintf("Referencia A: %d spots brutos -> %d tras vecindad\n", sum(plot_df$ref_A_bruta), sum(plot_df$ref_A_limpia)))
+cat(sprintf("Referencia B: %d spots brutos -> %d tras vecindad\n", sum(plot_df$ref_B_bruta), sum(plot_df$ref_B_limpia)))
+cat(sprintf("Referencia C: %d spots brutos -> %d tras vecindad\n", sum(plot_df$ref_C_bruta), sum(plot_df$ref_C_limpia)))
+```
+
+### 5. GMM como referencia visual (diagnóstico, no se usa en InferCNV)
+
+```{r}
+stromal_values <- plot_df$StromalScore[!is.na(plot_df$StromalScore)]
+gmm_model <- Mclust(stromal_values, G = 2:3, verbose = FALSE)
+stromal_component <- which.max(gmm_model$parameters$mean)
+umbral_gmm <- min(stromal_values[gmm_model$classification == stromal_component], na.rm = TRUE)
+cat(sprintf("(Referencia visual, no usada en InferCNV) GMM: threshold = %.3f\n", umbral_gmm))
+```
+
+## Decisión: referencia oficial
+
+Referencia oficial para continuar el pipeline: threshold asimétrico por
+paciente + filtro de vecindad (5% de contaminación tumoral para GIN63/GIN67,
+1% para GIN65/GIN71 — acuerdo con Ángel). Las referencias uniformes (5% y 1%
+para las 4 muestras) quedan también en el h5ad, como columnas aparte, para
+poder comparar su efecto en InferCNV.
+
+```{r}
+selected_threshold <- umbral_A
+THRESHOLD_METHOD <- sprintf("asimetrica_%dpct_vecindad", target_pct_asimetrico)
+
+plot_df$Threshold_Passed <- plot_df$ref_A_limpia
+plot_df$StromalScore_Positive <- ifelse(plot_df$Threshold_Passed, plot_df$StromalScore, NA)
+
+cat(sprintf("Referencia oficial: %s -> threshold=%.3f, n=%d spots\n",
+            THRESHOLD_METHOD, selected_threshold, sum(plot_df$Threshold_Passed)))
+```
+
+### El threshold en el espacio
+
+```{r}
+p_spatial_bool <- ggplot(plot_df, aes(x0 = x, y0 = -y, fill = Threshold_Passed)) +
+  geom_regon(aes(sides = 6, angle = 0, r = hex_radius), color = NA) +
+  scale_fill_manual(values = c("TRUE" = "#00FFFF", "FALSE" = "#A52A2A")) +
+  coord_fixed() +
+  labs(title = sprintf("Background spots (%s) — %s", THRESHOLD_METHOD, sample_name), fill = "Background") +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 11))
+
+ggsave(file.path(FIG_DIR, paste0("background_spots_", sample_name, ".png")), p_spatial_bool, width = 7, height = 7, dpi = 150)
+print(p_spatial_bool)
+```
+
+## Guardar objeto
+
+Todas las columnas calculadas (scores, umbrales, referencias A/B/C, vecindad) se añaden a `colData` y viajan en el h5ad final. InferCNV (script 04) puede filtrar directamente sobre `Threshold_Passed`, `ref_A_limpia`, `ref_B_limpia` o `ref_C_limpia`, sin reimportar nada aparte.
+
+```{r}
+sce$StromalScore_bg  <- plot_df$Threshold_Passed
+sce$vecinos_tumor     <- plot_df$vecinos_tumor
+sce$ref_A_limpia      <- plot_df$ref_A_limpia
+sce$ref_B_limpia      <- plot_df$ref_B_limpia
+sce$ref_C_limpia      <- plot_df$ref_C_limpia
+sce$threshold_method  <- THRESHOLD_METHOD
+sce$threshold_value   <- selected_threshold
+
+writeH5AD(sce, OUTPUT_FILE)
+
+cat(sprintf("Objeto guardado en: %s\n", OUTPUT_FILE))
+cat(sprintf("Spots: %d\n", ncol(sce)))
+cat(sprintf("ESTIMATEScore medio: %.2f\n", mean(sce$ESTIMATEScore, na.rm = TRUE)))
+cat(sprintf("TumorPurity media (proxy): %.3f\n", mean(sce$TumorPurity, na.rm = TRUE)))
+cat("\nNota metodológica: TumorPurity es un proxy normalizado de ESTIMATEScore\n")
+cat("(0-1, invertido), no la fórmula clásica de pureza Affymetrix, que no es\n")
+cat("válida para datos de RNA-seq/transcriptómica espacial por spot.\n")
+```
