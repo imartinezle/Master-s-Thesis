@@ -1,0 +1,491 @@
+---
+title: "InferCNV (sin anotación del patólogo)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+Infiere alteraciones de número de copia (CNV) a partir de expresión espacial.
+
+A diferencia de una primera versión del script, aquí no se usa `Layer_patologo`
+en ningún momento del análisis (ni para filtrar spots ni para agrupar): todos
+los spots se conservan y solo se distinguen dos grupos, `reference` (background
+calculado en el script 03) y `observation` (todo lo demás, sin distinguir
+región). La comparación por región se hace más adelante, fuera de este script.
+
+**Input:** `h5ad_outputs/{sample_name}_estimate.h5ad`
+**Output:** `h5ad_outputs/{sample_name}_infercnv.h5ad`
+
+```{r setup}
+# Descomenta el paciente a procesar (deja solo una línea activa).
+#   - GIN63, GIN67  -> threshold 5% -> leiden_resolution = 0.01
+#   - GIN65, GIN71  -> threshold 1% -> leiden_resolution = 0.03
+# sample_name <- "GIN63"
+# sample_name <- "GIN65"
+# sample_name <- "GIN67"
+sample_name <- "GIN71"
+
+# la referencia oficial ya viene decidida en el script 03 (asimétrica: 5%
+# GIN63/GIN67, 1% GIN65/GIN71), aquí solo se deriva la resolución de Leiden
+# que le corresponde a cada paciente para el subclustering de InferCNV
+if (sample_name %in% c("GIN63", "GIN67")) {
+  threshold_label <- "5pct"
+  LEIDEN_RESOLUTION <- 0.01
+} else if (sample_name %in% c("GIN65", "GIN71")) {
+  threshold_label <- "1pct"
+  LEIDEN_RESOLUTION <- 0.03
+} else {
+  stop(sprintf("sample_name desconocido (%s): no hay threshold/resolution definido para este paciente", sample_name))
+}
+
+cat(sprintf("Paciente: %s | Threshold: %s | leiden_resolution: %.2f\n", sample_name, threshold_label, LEIDEN_RESOLUTION))
+```
+
+**Muestra actual: `r sample_name` | Threshold: `r threshold_label` | leiden_resolution: `r LEIDEN_RESOLUTION`**
+
+## Librerías
+
+```{r}
+library(infercnv)
+library(zellkonverter)
+library(SingleCellExperiment)
+library(dplyr)
+library(ggplot2)
+
+set.seed(42)
+```
+
+InferCNV con HMM (predicción de estados discretos de CNV) necesita JAGS
+instalado a nivel de sistema, no es un paquete de R (`sudo apt-get install jags`
+o el gestor de paquetes del cluster, más `install.packages("rjags")`).
+
+## Rutas
+
+```{r}
+H5AD_DIR <- "/home/imartinezle/h5ad_outputs/"
+FIG_DIR  <- sprintf("/home/imartinezle/Figuras/figuras_%s/InferCNV/", sample_name)
+
+# InferCNV escribe muchos ficheros propios (heatmaps, matrices intermedias);
+# esos no son "figuras" del pipeline, se quedan en su propia carpeta de trabajo
+WORK_DIR   <- sprintf("/home/imartinezle/Resultados_R/%s/InferCNV/%s/", sample_name, threshold_label)
+DIR_RUN_OUT <- file.path(WORK_DIR, "run_output")
+
+INPUT_FILE  <- file.path(H5AD_DIR, paste0(sample_name, "_estimate.h5ad"))
+OUTPUT_FILE <- file.path(H5AD_DIR, paste0(sample_name, "_infercnv.h5ad"))
+
+for (d in c(DIR_RUN_OUT, FIG_DIR, H5AD_DIR)) {
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+}
+
+# fichero de orden génico (chr, start, end), mismo fichero para las 4 muestras.
+# Nota: es gencode v19, que corresponde a hg19 -- pendiente de verificar que
+# coincide con el genoma de referencia usado en Space Ranger antes de confiar
+# en las coordenadas para el análisis de cytobandas
+GENE_ORDER_FILE <- "/home/imartinezle/Scripts/gencode_v19_gene_post.txt"
+
+cat(sprintf("Input:  %s\n", INPUT_FILE))
+cat(sprintf("Output: %s\n", OUTPUT_FILE))
+```
+
+## Cargar datos
+
+```{r}
+sce <- readH5AD(INPUT_FILE)
+
+cat("Assays disponibles:", assayNames(sce), "\n")
+cat(sprintf("Spots: %d | Genes: %d\n", ncol(sce), nrow(sce)))
+```
+
+## Elegir la referencia de background
+
+El script 03 calcula tres variantes de referencia, pero solo deja una como
+oficial: la asimétrica (`ref_A_limpia`), con el threshold que le corresponde
+a cada paciente. Es la que se usa aquí.
+
+```{r}
+columna_referencia <- "ref_A_limpia"
+
+background_mask <- colData(sce)[[columna_referencia]]
+cat(sprintf("Columna de referencia usada: %s\n", columna_referencia))
+cat(sprintf("Spots de referencia (background): %d\n", sum(background_mask, na.rm = TRUE)))
+```
+
+## Construir las anotaciones (grupo de cada spot)
+
+Sin anotación del patólogo: solo dos grupos posibles, `reference` (background)
+y `observation` (todo lo demás). La comparación por región/espacio se hace
+más adelante, fuera de este script.
+
+```{r}
+cnv_annotations <- data.frame(
+  barcode = colnames(sce),
+  group   = "observation",
+  stringsAsFactors = FALSE
+)
+cnv_annotations$group[background_mask] <- "reference"
+
+cat("Distribución de grupos para InferCNV:\n")
+print(table(cnv_annotations$group))
+
+n_ref <- sum(cnv_annotations$group == "reference")
+if (n_ref < 20) {
+  stop(sprintf("Solo hay %d spots de referencia -- insuficiente para InferCNV (mínimo recomendado ~20-30).", n_ref))
+}
+
+ANNOTATIONS_FILE <- file.path(WORK_DIR, paste0(sample_name, "_cnv_annotations.txt"))
+write.table(cnv_annotations, ANNOTATIONS_FILE, sep = "\t", quote = FALSE,
+            row.names = FALSE, col.names = FALSE)
+```
+
+## Preparar la matriz de counts
+
+InferCNV necesita counts crudos, no normalizados. El assay `counts` del h5ad
+es la copia que se guardó en el notebook 01 antes de `normalize_total`/`log1p`,
+así que se usa directamente, sin deslogaritmizar nada.
+
+```{r}
+counts_matrix <- as.matrix(assay(sce, "counts"))
+
+gene_order <- read.table(GENE_ORDER_FILE, sep = "\t", header = FALSE, stringsAsFactors = FALSE,
+                          col.names = c("gene", "chr", "start", "end"))
+
+genes_comunes <- intersect(rownames(counts_matrix), gene_order$gene)
+cat(sprintf("Genes en la matriz: %d | Genes en gene_order: %d | Genes comunes: %d\n",
+            nrow(counts_matrix), nrow(gene_order), length(genes_comunes)))
+
+if (length(genes_comunes) < 5000) {
+  cat("AVISO: menos de 5000 genes comunes -- revisa que GENE_ORDER_FILE use los mismos\n")
+  cat("símbolos de gen que el h5ad, y el mismo genoma de referencia.\n")
+}
+
+counts_matrix <- counts_matrix[genes_comunes, , drop = FALSE]
+cat(sprintf("Matriz final para InferCNV: %d genes x %d spots\n", nrow(counts_matrix), ncol(counts_matrix)))
+```
+
+## Crear el objeto InferCNV
+
+```{r}
+infercnv_obj <- infercnv::CreateInfercnvObject(
+  raw_counts_matrix = counts_matrix,
+  annotations_file  = ANNOTATIONS_FILE,
+  gene_order_file   = GENE_ORDER_FILE,
+  ref_group_names   = "reference"
+)
+```
+
+## Ejecutar InferCNV
+
+`cutoff = 0.1` es el valor recomendado para datos 10x/Visium (más laxo que el
+`1` habitual en scRNA-seq de placa). `cluster_by_groups = FALSE` porque ya no
+hay región del patólogo por la que agrupar, solo `reference`/`observation`, así
+que el clustering queda libre dentro de `observation`. `leiden_resolution` se
+fija según el paciente (ver setup), con el valor decidido tras revisar el codo
+para cada uno (ver notebook de decisión). Este paso es el más lento del
+pipeline (de minutos a >1h según nº de spots/genes y núcleos disponibles).
+
+```{r}
+NUM_THREADS <- 32   # ajustar según nodo/workstation
+
+# checkpointing: si ya se corrió infercnv para esta muestra/threshold, no se
+# vuelve a lanzar (es el paso más lento del pipeline). Los chunks siguientes
+# leen de los ficheros en DIR_RUN_OUT, no del objeto devuelto por run(), así
+# que reutilizar resultados antiguos es seguro aunque no se reasigne la variable.
+FORCE_RERUN_INFERCNV <- FALSE
+
+infercnv_done <- file.exists(file.path(DIR_RUN_OUT, "infercnv.png")) &&
+  file.exists(file.path(DIR_RUN_OUT, "infercnv_subclusters.observation_groupings.txt"))
+
+if (FORCE_RERUN_INFERCNV || !infercnv_done) {
+  infercnv::run(
+    infercnv_obj,
+    cutoff            = 0.1,
+    out_dir           = DIR_RUN_OUT,
+    cluster_by_groups = FALSE,
+    denoise           = TRUE,
+    HMM               = TRUE,
+    HMM_type          = "i6",       # modelo de 6 estados, más robusto en baja cobertura
+    num_threads       = NUM_THREADS,
+    no_prelim_plot    = FALSE,
+    write_expr_matrix = TRUE,
+    save_rds          = FALSE,
+    save_final_rds    = FALSE,
+
+    tumor_subcluster_partition_method = "leiden",
+    leiden_resolution                 = LEIDEN_RESOLUTION,
+    tumor_subcluster_pval             = 0.1,
+    k_nn                              = 30,
+
+    output_format = "png"
+  )
+  cat(sprintf("InferCNV completado. Resultados en: %s\n", DIR_RUN_OUT))
+} else {
+  cat(sprintf("InferCNV ya se había corrido antes para %s (%s) -- se reutilizan los resultados existentes en:\n%s\n",
+              sample_name, threshold_label, DIR_RUN_OUT))
+  cat("(para forzar un nuevo cálculo, cambiar FORCE_RERUN_INFERCNV a TRUE)\n")
+}
+```
+
+## Imágenes generadas por InferCNV
+
+`run()` ya genera sus propios heatmaps directamente en `DIR_RUN_OUT`
+(preliminar antes de eliminar ruido, y final tras denoise + HMM). Se copian a
+la carpeta de figuras del pipeline y se muestran aquí, en vez de dejarlas
+sueltas en la carpeta de trabajo.
+
+```{r}
+imagen_preliminar <- file.path(DIR_RUN_OUT, "infercnv.preliminary.png")
+imagen_final       <- file.path(DIR_RUN_OUT, "infercnv.png")
+
+for (img in c(imagen_preliminar, imagen_final)) {
+  if (file.exists(img)) {
+    file.copy(img, file.path(FIG_DIR, sprintf("%s_%s", sample_name, basename(img))), overwrite = TRUE)
+  } else {
+    cat(sprintf("Aviso: no se encontró %s (puede que infercnv haya cambiado el nombre en esta versión)\n", img))
+  }
+}
+```
+
+### Heatmap preliminar (antes de denoise)
+
+```{r, results='asis'}
+if (file.exists(imagen_preliminar)) {
+  cat(sprintf("![Preliminary heatmap (%s)](%s)\n", sample_name, imagen_preliminar))
+} else {
+  cat("*(no disponible)*\n")
+}
+```
+
+### Heatmap final (denoise + HMM)
+
+```{r, results='asis'}
+if (file.exists(imagen_final)) {
+  cat(sprintf("![Final heatmap (%s)](%s)\n", sample_name, imagen_final))
+} else {
+  cat("*(no disponible)*\n")
+}
+```
+
+El resto de pasos intermedios que genera InferCNV (suavizado por cromosoma,
+subclusters, estados HMM...) se quedan numerados en `DIR_RUN_OUT` por si hace
+falta revisarlos, pero no se muestran todos aquí para no saturar el informe.
+
+## Añadir los subclusters de InferCNV al objeto
+
+```{r}
+groupings <- read.table(
+  file.path(DIR_RUN_OUT, "infercnv_subclusters.observation_groupings.txt"),
+  header = TRUE, sep = "", stringsAsFactors = FALSE, check.names = FALSE
+)
+
+# match por barcode, no por orden (los grupos solo cubren "observation")
+idx <- match(colnames(sce), rownames(groupings))
+sce$InferCNV_cluster <- groupings$`Annotation Group`[idx]
+sce$InferCNV_cluster[cnv_annotations$group == "reference"] <- "ref"
+sce$InferCNV_group <- cnv_annotations$group
+
+print(table(sce$InferCNV_cluster))
+```
+
+## Visualización espacial
+
+```{r}
+if ("spatial" %in% names(reducedDims(sce))) {
+  coords <- reducedDim(sce, "spatial")
+  sce$row <- coords[, 2]
+  sce$col <- coords[, 1]
+} else {
+  sce$row <- colData(sce)$array_row
+  sce$col <- colData(sce)$array_col
+}
+
+calc_hex_radius <- function(data, n_sample = 2000) {
+  set.seed(1)
+  idx <- sample(seq_len(nrow(data)), min(n_sample, nrow(data)))
+  d_mat <- as.matrix(dist(data[idx, c("x", "y")]))
+  diag(d_mat) <- Inf
+  min(apply(d_mat, 1, min)) / sqrt(3)
+}
+
+plot_df <- data.frame(x = sce$col, y = sce$row, cluster = as.factor(sce$InferCNV_cluster))
+hex_radius <- calc_hex_radius(plot_df)
+
+# paleta apta para daltónicos; 'ref' en un color neutro distinguible del resto.
+# se reutiliza en el heatmap propio (sección siguiente) para que ambas figuras
+# usen exactamente los mismos colores por cluster
+paleta_infercnv <- c(
+  "ref" = "#B4B2A9",
+  "1"   = "#00216C",
+  "2"   = "#FF6B6B",
+  "3"   = "#E61B71",
+  "4"   = "#7B2CBF",
+  "5"   = "#FFB703"
+)
+
+p_infercnv <- ggplot(plot_df, aes(x0 = x, y0 = -y, fill = cluster)) +
+  geom_regon(aes(sides = 6, angle = 0, r = hex_radius)) +
+  scale_fill_manual(values = paleta_infercnv, na.value = "grey80") +
+  coord_fixed() +
+  labs(title = sprintf("InferCNV clusters (%s, %s)", sample_name, threshold_label), fill = "Cluster") +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave(file.path(FIG_DIR, sprintf("infercnv_clusters_%s_%s.png", sample_name, threshold_label)),
+       p_infercnv, width = 10, height = 10, dpi = 150)
+print(p_infercnv)
+```
+
+## Heatmap propio, con los mismos colores que el plot espacial
+
+El `infercnv.png` de la sección anterior usa la paleta interna del propio
+paquete para la barra de anotación de clusters, que no podemos controlar
+desde `run()`. Para tener un heatmap con los mismos colores que el plot
+espacial de arriba, se construye uno propio a partir de la matriz de
+resultados (`infercnv.observations.txt`), coloreado con `paleta_infercnv`.
+
+```{r}
+library(pheatmap)
+
+heatmap_ok <- tryCatch({
+  cnv_matrix <- as.matrix(read.table(
+    file.path(DIR_RUN_OUT, "infercnv.observations.txt"),
+    header = TRUE, row.names = 1, check.names = FALSE
+  ))
+
+  annotation_spots <- data.frame(
+    cluster = factor(sce$InferCNV_cluster[match(colnames(cnv_matrix), colnames(sce))])
+  )
+  rownames(annotation_spots) <- colnames(cnv_matrix)
+
+  pheatmap(
+    t(cnv_matrix),
+    cluster_rows      = FALSE,
+    cluster_cols      = FALSE,
+    show_rownames     = FALSE,
+    show_colnames     = FALSE,
+    annotation_row    = annotation_spots,
+    annotation_colors = list(cluster = paleta_infercnv),
+    main              = sprintf("InferCNV heatmap (%s, %s)", sample_name, threshold_label),
+    filename          = file.path(FIG_DIR, sprintf("infercnv_heatmap_%s_%s.png", sample_name, threshold_label)),
+    width             = 12,
+    height            = 10
+  )
+  TRUE
+}, error = function(e) {
+  cat(sprintf("Aviso: no se pudo generar el heatmap propio (%s). Se continúa con el resto del script.\n", conditionMessage(e)))
+  FALSE
+})
+
+if (heatmap_ok) {
+  knitr::include_graphics(file.path(FIG_DIR, sprintf("infercnv_heatmap_%s_%s.png", sample_name, threshold_label)))
+}
+```
+
+## Clusters de InferCNV por región dominante del patólogo
+
+Cada cluster de InferCNV se etiqueta según la región del patólogo mayoritaria
+entre sus spots (Tumor, Stroma, o Stroma linfos si el paciente tiene esa
+categoría), numerando dentro de cada región (Tumor 1, Tumor 2, Stroma 1...).
+Esto no cambia el clustering en sí, solo lo reetiqueta para que se lea de un
+vistazo qué clusters caen en zona tumoral y cuáles en estroma.
+
+```{r}
+tabla_cluster_patologo <- table(sce$InferCNV_cluster, sce$Layer_patologo)
+tabla_cluster_patologo <- tabla_cluster_patologo[rownames(tabla_cluster_patologo) != "ref", , drop = FALSE]
+print(tabla_cluster_patologo)
+
+if (nrow(tabla_cluster_patologo) == 0) {
+  stop("No hay clusters distintos de 'ref' -- revisa sce$InferCNV_cluster (¿el match con groupings falló para todos los spots?).")
+}
+
+# region dominante de cada cluster, por mayoria de spots
+dominante <- colnames(tabla_cluster_patologo)[apply(tabla_cluster_patologo, 1, which.max)]
+names(dominante) <- rownames(tabla_cluster_patologo)
+print(dominante)
+```
+
+```{r}
+nombre_categoria <- c(tumor = "Tumor", stroma = "Stroma", stroma_linfos = "Stroma linfos")
+
+etiquetas_cluster <- setNames(character(length(dominante)), names(dominante))
+for (categoria in unique(dominante)) {
+  clusters_categoria <- names(dominante)[dominante == categoria]
+  clusters_categoria <- clusters_categoria[order(as.numeric(clusters_categoria))]
+  for (i in seq_along(clusters_categoria)) {
+    etiquetas_cluster[clusters_categoria[i]] <- sprintf("%s %d", nombre_categoria[[categoria]], i)
+  }
+}
+
+sce$InferCNV_cluster_label <- ifelse(
+  sce$InferCNV_cluster == "ref", "Ref",
+  etiquetas_cluster[as.character(sce$InferCNV_cluster)]
+)
+print(table(sce$InferCNV_cluster_label))
+```
+
+```{r}
+# paleta por categoria: rojos para tumor, verdes para estroma, azules para
+# estroma_linfos (si el paciente tiene esa categoria); 'Ref' en gris neutro
+generar_paleta_categoria <- function(etiquetas, colores_base) {
+  n <- length(etiquetas)
+  if (n == 0) return(character(0))
+  intensidades <- seq(0.85, 0.4, length.out = max(n, 2))[seq_len(n)]
+  cmap <- colorRampPalette(colores_base)(100)
+  setNames(cmap[round(intensidades * 99) + 1], etiquetas)
+}
+
+etiquetas_tumor  <- sort(grep("^Tumor",         unique(sce$InferCNV_cluster_label), value = TRUE))
+etiquetas_stroma <- sort(grep("^Stroma ",       unique(sce$InferCNV_cluster_label), value = TRUE))
+etiquetas_linfos <- sort(grep("^Stroma linfos", unique(sce$InferCNV_cluster_label), value = TRUE))
+
+paleta_categoria <- c(
+  generar_paleta_categoria(etiquetas_tumor,  c("#FFCDBF", "#67000D")),   # rojos
+  generar_paleta_categoria(etiquetas_stroma, c("#C7E9C0", "#00441B")),   # verdes
+  generar_paleta_categoria(etiquetas_linfos, c("#C6DBEF", "#08306B")),   # azules
+  "Ref" = "#B4B2A9"
+)
+print(paleta_categoria)
+```
+
+```{r}
+plot_df$cluster_label <- sce$InferCNV_cluster_label
+
+p_infercnv_categoria <- ggplot(plot_df, aes(x0 = x, y0 = -y, fill = cluster_label)) +
+  geom_regon(aes(sides = 6, angle = 0, r = hex_radius)) +
+  scale_fill_manual(values = paleta_categoria, na.value = "grey80") +
+  coord_fixed() +
+  labs(title = sprintf("InferCNV clusters by pathologist region (%s, %s)", sample_name, threshold_label),
+       fill = "Cluster") +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave(file.path(FIG_DIR, sprintf("infercnv_clusters_por_region_%s_%s.png", sample_name, threshold_label)),
+       p_infercnv_categoria, width = 10, height = 10, dpi = 150)
+print(p_infercnv_categoria)
+```
+
+Si el paciente no tiene la categoría `stroma_linfos` (GIN63 y GIN67 solo
+tienen tumor/stroma/unannotated), `etiquetas_linfos` sale vacío y esa parte
+de la paleta simplemente no se genera, sin dar error.
+
+## Guardar objeto
+
+```{r}
+sce$InferCNV_cluster_label <- plot_df$cluster_label
+
+writeH5AD(sce, OUTPUT_FILE)
+
+cat(sprintf("Objeto guardado en: %s\n", OUTPUT_FILE))
+cat(sprintf("Spots: %d\n", ncol(sce)))
+cat(sprintf("Referencia usada: %s (%s)\n", threshold_label, columna_referencia))
+```
