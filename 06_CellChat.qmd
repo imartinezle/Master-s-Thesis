@@ -1,0 +1,439 @@
+---
+title: "CellChat — comunicación célula-célula"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+Último paso del pipeline. A diferencia de los scripts anteriores, este **solo
+lee** el h5ad final (`GIN{XX}_cell2location.h5ad`, salida del 05) y no genera
+ningún h5ad nuevo — todo lo que hace falta ya está acumulado ahí (anotación
+del patólogo, los 4 métodos de clustering, InferCNV, abundancias de
+cell2location).
+
+Se corre CellChat con dos agrupaciones, coherente con la decisión final de
+que **BayesSpace** (no GraphST) es el método de clustering de referencia del
+pipeline:
+
+-   **`BayesSpace`** — clustering espacial de referencia (notebook 02b). El
+    nombre exacto de la columna puede variar entre muestras (`BayesSpace_k7`,
+    `BayesSpace_k8`...) según el `q` usado, así que se detecta automáticamente
+    por prefijo.
+-   **`InferCNV_cluster_label`** — subclusters de InferCNV etiquetados por
+    región dominante (Tumor 1, Tumor 2, Stroma 1...), del script 04
+
+**Input:** `h5ad_outputs/{sample_name}_cell2location.h5ad`
+
+```{r setup}
+# cambiar sample_name para procesar otra muestra
+sample_name <- "GIN63"
+# sample_name <- "GIN65"
+# sample_name <- "GIN67"
+# sample_name <- "GIN71"
+
+cat(sprintf("Procesando paciente: %s\n", sample_name))
+```
+
+**Muestra actual: `r sample_name`**
+
+## Librerías
+
+```{r}
+library(CellChat)
+library(SingleCellExperiment)
+library(zellkonverter)
+library(ggplot2)
+library(patchwork)
+library(jsonlite)
+library(dplyr)
+library(scales)
+
+options(stringsAsFactors = FALSE)
+```
+
+## Rutas
+
+```{r}
+H5AD_DIR   <- "/home/imartinezle/h5ad_outputs/"
+FIG_DIR    <- sprintf("/home/imartinezle/Figuras/figuras_%s/CellChat/", sample_name)
+WORK_DIR   <- sprintf("/home/imartinezle/Resultados_R/%s/CellChat/", sample_name)
+SR_DIR     <- sprintf("/home/imartinezle/Spatial_transcriptomics/Resultados_Spatial/%s", sample_name)
+
+INPUT_FILE <- file.path(H5AD_DIR, paste0(sample_name, "_cell2location.h5ad"))
+
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(WORK_DIR, showWarnings = FALSE, recursive = TRUE)
+
+TOP_N_PATHWAYS <- 10   # nº de pathways a representar individualmente por agrupación
+MIN_CELLS      <- 10   # mínimo de spots por grupo para incluir una interacción
+
+cat(sprintf("Input: %s\n", INPUT_FILE))
+```
+
+## Cargar datos
+
+```{r}
+sce <- readH5AD(INPUT_FILE)
+
+cat(sprintf("Spots: %d | Genes: %d\n", ncol(sce), nrow(sce)))
+cat("Columnas disponibles en colData:\n")
+print(colnames(colData(sce)))
+
+# la columna de BayesSpace puede llamarse BayesSpace_k7, BayesSpace_k8...
+# segun el q usado en esta muestra -- se detecta por prefijo
+col_bayesspace <- grep("^BayesSpace", colnames(colData(sce)), value = TRUE)
+if (length(col_bayesspace) == 0) {
+  stop("No se encontró ninguna columna 'BayesSpace_*' en colData(sce).")
+}
+col_bayesspace <- col_bayesspace[1]
+cat(sprintf("Columna de BayesSpace detectada: %s\n", col_bayesspace))
+```
+
+## Recalcular el log-normalizado desde counts crudos
+
+`X` dejó de ser fiable como log-normalizado desde el notebook 02a:
+`sc.pp.scale()` sobrescribe `adata.X` in-place con datos escalados (z-score,
+recortado a ±10), así que a partir de ahí `X` es escalado, no log-normalizado
+— y ese `X` escalado es el que ha viajado por toda la cadena (02b, 03, 04, 05).
+En vez de adivinar qué assay usar, se recalcula el log-normalizado
+directamente desde `counts` (que sí se conserva intacto en toda la cadena),
+replicando exactamente `sc.pp.normalize_total(target_sum=1e4)` + `sc.pp.log1p()`
+del notebook 01.
+
+```{r}
+counts_mat <- as.matrix(assay(sce, "counts"))
+lib_size <- colSums(counts_mat)
+data_input <- log1p(sweep(counts_mat, 2, lib_size, "/") * 1e4)
+
+cat(sprintf("Rango de data_input tras recalcular: %.2f a %.2f (debe ser >= 0)\n",
+            min(data_input), max(data_input)))
+
+meta <- as.data.frame(colData(sce))
+rownames(meta) <- colnames(sce)
+```
+
+## Coordenadas espaciales
+
+```{r}
+stopifnot("spatial" %in% reducedDimNames(sce))
+
+spatial_coords <- as.data.frame(reducedDim(sce, "spatial"))
+colnames(spatial_coords) <- c("imagecol", "imagerow")
+rownames(spatial_coords) <- colnames(sce)
+
+scalefactors_path <- file.path(SR_DIR, "spatial", "scalefactors_json.json")
+stopifnot(file.exists(scalefactors_path))
+sf_json <- fromJSON(txt = scalefactors_path)
+
+# factor de conversion pixeles (full-res) -> micras, y tolerancia (mitad del
+# diametro del spot). CellChat espacial usa spatial.factors, no scale.factors.
+conversion_factor <- 65 / sf_json$spot_diameter_fullres
+spatial_factors <- data.frame(ratio = conversion_factor, tol = 65 / 2)
+
+print(spatial_factors)
+```
+
+## Paletas por tipo de agrupación
+
+```{r}
+palette_patologo <- c(
+  "tumor" = "#D85A30", "stroma" = "#1D9E75",
+  "stroma_linfos" = "#534AB7", "unannotated" = "#B4B2A9"
+)
+
+# para agrupaciones sin significado biologico fijo por nivel (GraphST, Leiden...)
+# se genera una paleta generica, consistente dentro del mismo grupo
+construir_paleta_generica <- function(niveles) {
+  colores <- scales::hue_pal()(length(niveles))
+  setNames(colores, niveles)
+}
+
+# para InferCNV_cluster_label (Tumor 1, Tumor 2, Stroma 1, Ref...): mismo
+# esquema rojos/verdes/azules que ya se usó en el script 04
+construir_paleta_categoria_infercnv <- function(niveles) {
+  generar <- function(etiquetas, colores_base) {
+    n <- length(etiquetas)
+    if (n == 0) return(character(0))
+    intensidades <- seq(0.85, 0.4, length.out = max(n, 2))[seq_len(n)]
+    cmap <- colorRampPalette(colores_base)(100)
+    setNames(cmap[round(intensidades * 99) + 1], etiquetas)
+  }
+  tumor  <- sort(grep("^Tumor",         niveles, value = TRUE))
+  stroma <- sort(grep("^Stroma ",       niveles, value = TRUE))
+  linfos <- sort(grep("^Stroma linfos", niveles, value = TRUE))
+  c(
+    generar(tumor,  c("#FFCDBF", "#67000D")),
+    generar(stroma, c("#C7E9C0", "#00441B")),
+    generar(linfos, c("#C6DBEF", "#08306B")),
+    "Ref" = "#B4B2A9"
+  )
+}
+
+obtener_paleta <- function(group_col, niveles) {
+  if (group_col == "Layer_patologo") {
+    pal <- palette_patologo[niveles]
+    pal[is.na(pal)] <- "#999999"
+    pal
+  } else if (group_col == "InferCNV_cluster_label") {
+    construir_paleta_categoria_infercnv(niveles)
+  } else {
+    # BayesSpace_k7, BayesSpace_k8... y cualquier otra agrupacion sin
+    # significado biologico fijo por nivel
+    construir_paleta_generica(niveles)
+  }
+}
+```
+
+## Función auxiliar: pipeline CellChat completo
+
+Se encapsula el pipeline estándar (modo espacial) en una función para
+reutilizarlo con las distintas agrupaciones sin duplicar código.
+
+```{r}
+run_cellchat_pipeline <- function(data_input, meta, group_col, spatial_coords,
+                                   spatial_factors, min_cells = MIN_CELLS,
+                                   out_dir = WORK_DIR, label_prefix = "") {
+
+  stopifnot(group_col %in% colnames(meta))
+  meta_f <- meta
+  meta_f[[group_col]] <- as.factor(meta_f[[group_col]])
+
+  # se descartan grupos con muy pocos spots (CellChat falla si algun nivel
+  # queda vacio tras el filtrado interno)
+  group_sizes <- table(meta_f[[group_col]])
+  grupos_validos <- names(group_sizes)[group_sizes >= min_cells]
+  keep <- meta_f[[group_col]] %in% grupos_validos
+  meta_f <- droplevels(meta_f[keep, , drop = FALSE])
+  data_input_f <- data_input[, rownames(meta_f)]
+  spatial_coords_f <- spatial_coords[rownames(meta_f), ]
+
+  cellchat <- createCellChat(
+    object          = data_input_f,
+    meta            = meta_f,
+    group.by        = group_col,
+    datatype        = "spatial",
+    coordinates     = as.matrix(spatial_coords_f),
+    spatial.factors = spatial_factors
+  )
+
+  cellchat@DB <- CellChatDB.human
+
+  cellchat <- subsetData(cellchat)
+  cellchat <- identifyOverExpressedGenes(cellchat, do.fast = FALSE)
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+
+  cellchat <- computeCommunProb(
+    cellchat,
+    type              = "truncatedMean",
+    trim              = 0.1,
+    distance.use      = TRUE,
+    interaction.range = 250,
+    scale.distance    = 0.01,
+    contact.dependent = TRUE,
+    contact.range     = 200
+  )
+
+  cellchat <- filterCommunication(cellchat, min.cells = min_cells)
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat <- aggregateNet(cellchat)
+  cellchat <- netAnalysis_computeCentrality(cellchat)  # roles emisor/receptor por grupo, para las heatmaps de rol de señalización
+
+  write.csv(subsetCommunication(cellchat),
+            file.path(out_dir, paste0(label_prefix, "_significant_interactions.csv")), row.names = FALSE)
+  write.csv(subsetCommunication(cellchat, slot.name = "netP"),
+            file.path(out_dir, paste0(label_prefix, "_significant_pathways.csv")), row.names = FALSE)
+  saveRDS(cellchat, file.path(out_dir, paste0(label_prefix, "_cellchat.rds")))
+
+  cellchat
+}
+```
+
+## Función auxiliar: visualizaciones estándar
+
+Cada figura se guarda en `fig_dir` con `png()`/`dev.off()` (para las que
+dibujan directamente, como `netVisual_circle`) o con `ggsave()` (para las que
+devuelven un objeto `ggplot`, como `rankNet`).
+
+```{r}
+visualizar_cellchat <- function(cellchat, group_col, colores, sample_name, fig_dir, top_n = TOP_N_PATHWAYS) {
+
+  group_size <- as.numeric(table(cellchat@idents))
+  titulo_base <- sprintf("%s (%s)", sample_name, group_col)
+  prefijo <- file.path(fig_dir, paste0(sample_name, "_", group_col, "_"))
+
+  # 1. red agregada de interacciones: cuantas interacciones hay entre cada
+  # par de grupos, y de que tamaño es cada grupo (grosor del nodo)
+  png(paste0(prefijo, "circle_count.png"), width = 7 * 150, height = 7 * 150, res = 150)
+  netVisual_circle(
+    cellchat@net$count, vertex.weight = group_size, weight.scale = TRUE,
+    label.edge = FALSE, color.use = colores,
+    title.name = paste("Number of interactions -", titulo_base)
+  )
+  dev.off()
+
+  # 2. heatmap de pesos de interaccion: lo mismo que el circle plot pero en
+  # forma de matriz, mas facil de leer con muchos grupos
+  png(paste0(prefijo, "heatmap_weights.png"), width = 6 * 150, height = 5 * 150, res = 150)
+  print(netVisual_heatmap(cellchat, color.use = colores,
+                           title.name = paste("Interaction weights -", titulo_base)))
+  dev.off()
+
+  # 3. ranking de pathways por fuerza de señal total
+  p_rank <- rankNet(cellchat, mode = "single", stacked = TRUE, do.stat = TRUE) +
+    ggtitle(paste("Pathway signaling contribution -", titulo_base))
+  ggsave(paste0(prefijo, "rank_pathways.png"), p_rank, width = 7, height = 6, dpi = 150)
+  print(p_rank)
+
+  # 4. rol de señalizacion por grupo: cuanto emite (outgoing) y cuanto recibe
+  # (incoming) cada grupo, desglosado por pathway -- util para identificar
+  # que cluster actua como "hub" de comunicacion
+  tryCatch({
+    png(paste0(prefijo, "signaling_role_heatmap_outgoing.png"), width = 8 * 150, height = 6 * 150, res = 150)
+    print(netAnalysis_signalingRole_heatmap(cellchat, pattern = "outgoing", color.use = colores,
+                                             title = paste("Outgoing signaling -", titulo_base)))
+    dev.off()
+
+    png(paste0(prefijo, "signaling_role_heatmap_incoming.png"), width = 8 * 150, height = 6 * 150, res = 150)
+    print(netAnalysis_signalingRole_heatmap(cellchat, pattern = "incoming", color.use = colores,
+                                             title = paste("Incoming signaling -", titulo_base)))
+    dev.off()
+  }, error = function(e) {
+    cat(sprintf("Aviso: no se pudieron generar las heatmaps de rol de señalización (%s)\n", conditionMessage(e)))
+  })
+
+  # 5. scatter de rol de señalizacion: posiciona cada grupo segun cuanto
+  # emite (eje x) vs cuanto recibe (eje y) en total -- de un vistazo se ve
+  # que grupos son mas "emisores" y cuales mas "receptores"
+  tryCatch({
+    png(paste0(prefijo, "signaling_role_scatter.png"), width = 7 * 150, height = 6 * 150, res = 150)
+    print(netAnalysis_signalingRole_scatter(cellchat, color.use = colores) +
+            ggtitle(paste("Signaling role (outgoing vs incoming) -", titulo_base)))
+    dev.off()
+  }, error = function(e) {
+    cat(sprintf("Aviso: no se pudo generar el scatter de rol de señalización (%s)\n", conditionMessage(e)))
+  })
+
+  # 6. proyeccion espacial de la comunicacion agregada (suma de todos los
+  # pathways). Sin title.name: al pasar varios pathways a la vez, choca con
+  # el titulo que construye internamente netVisual_spatial()
+  png(paste0(prefijo, "spatial_aggregate.png"), width = 7 * 150, height = 7 * 150, res = 150)
+  netVisual_aggregate(
+    cellchat, signaling = cellchat@netP$pathways, layout = "spatial",
+    color.use = colores, vertex.size.max = 1, edge.width.max = 2
+  )
+  dev.off()
+
+  # 7. top pathways individuales (circle plot), uno por pathway
+  pathway_strength <- sapply(cellchat@netP$pathways, function(pw) sum(cellchat@netP$prob[, , pw]))
+  top_pathways <- names(sort(pathway_strength, decreasing = TRUE))[seq_len(min(top_n, length(pathway_strength)))]
+  cat("Top pathways por fuerza de señal:\n")
+  print(top_pathways)
+
+  for (pw in top_pathways) {
+    png(paste0(prefijo, "circle_", pw, ".png"), width = 6 * 150, height = 6 * 150, res = 150)
+    netVisual_aggregate(
+      cellchat, signaling = pw, layout = "circle", color.use = colores,
+      vertex.size.max = 1, edge.width.max = 2,
+      title.name = paste0(pw, " signaling network (", group_col, ")")
+    )
+    dev.off()
+  }
+
+  # 8. bubble plot: todos los pares ligando-receptor de los top pathways,
+  # cruzados entre grupo emisor y grupo receptor
+  p_bubble <- netVisual_bubble(cellchat, signaling = top_pathways, remove.isolate = FALSE) +
+    ggtitle(paste("Ligand-receptor pairs (top pathways) -", titulo_base))
+  ggsave(paste0(prefijo, "bubble_top_pathways.png"), p_bubble, width = 8, height = 8, dpi = 150)
+  print(p_bubble)
+
+  # 9. chord diagram: vision alternativa al circle plot de la red agregada,
+  # mas legible cuando hay muchos grupos o interacciones muy desiguales
+  tryCatch({
+    png(paste0(prefijo, "chord_aggregate.png"), width = 7 * 150, height = 7 * 150, res = 150)
+    netVisual_chord_cell(cellchat, color.use = colores,
+                          title.name = paste("Aggregated communication (chord) -", titulo_base))
+    dev.off()
+  }, error = function(e) {
+    cat(sprintf("Aviso: no se pudo generar el chord diagram (%s)\n", conditionMessage(e)))
+  })
+
+  cat(sprintf("Figuras guardadas en: %s (prefijo %s*)\n", fig_dir, basename(prefijo)))
+  invisible(top_pathways)
+}
+```
+
+## Ejecución: `BayesSpace` (clustering espacial de referencia)
+
+```{r}
+cellchat_bayesspace <- run_cellchat_pipeline(
+  data_input, meta, group_col = col_bayesspace,
+  spatial_coords = spatial_coords, spatial_factors = spatial_factors,
+  out_dir = WORK_DIR, label_prefix = paste0(sample_name, "_bayesspace")
+)
+```
+
+```{r}
+colores_bayesspace <- obtener_paleta(col_bayesspace, levels(cellchat_bayesspace@idents))
+visualizar_cellchat(cellchat_bayesspace, col_bayesspace, colores_bayesspace, sample_name, FIG_DIR)
+```
+
+## Ejecución: `InferCNV_cluster_label` (subclusters CNV por región)
+
+```{r}
+if (!("InferCNV_cluster_label" %in% colnames(meta))) {
+  stop("La columna 'InferCNV_cluster_label' no existe en colData(sce). Columnas disponibles: ",
+       paste(colnames(meta), collapse = ", "))
+}
+
+cellchat_infercnv <- run_cellchat_pipeline(
+  data_input, meta, group_col = "InferCNV_cluster_label",
+  spatial_coords = spatial_coords, spatial_factors = spatial_factors,
+  out_dir = WORK_DIR, label_prefix = paste0(sample_name, "_infercnv")
+)
+```
+
+```{r}
+colores_infercnv <- obtener_paleta("InferCNV_cluster_label", levels(cellchat_infercnv@idents))
+visualizar_cellchat(cellchat_infercnv, "InferCNV_cluster_label", colores_infercnv, sample_name, FIG_DIR)
+```
+
+## Resumen comparativo
+
+```{r}
+resumen <- data.frame(
+  agrupacion      = c(col_bayesspace, "InferCNV_cluster_label"),
+  n_grupos        = c(length(levels(cellchat_bayesspace@idents)),
+                       length(levels(cellchat_infercnv@idents))),
+  n_interacciones = c(nrow(subsetCommunication(cellchat_bayesspace)),
+                       nrow(subsetCommunication(cellchat_infercnv))),
+  n_pathways      = c(length(cellchat_bayesspace@netP$pathways),
+                       length(cellchat_infercnv@netP$pathways))
+)
+
+write.csv(resumen, file.path(WORK_DIR, paste0(sample_name, "_summary.csv")), row.names = FALSE)
+knitr::kable(resumen)
+```
+
+## Notas de ejecución
+
+-   `CellChatDB.human` se usa fijo — cambiar a `CellChatDB.mouse` si en algún
+    momento se procesan datos de ratón.
+-   Este script no genera ningún h5ad: es el último paso de la cadena, y el
+    `.rds` de cada `cellchat` (uno por agrupación) es el artefacto final,
+    guardado en `WORK_DIR`.
+-   Todas las figuras se guardan en `FIG_DIR` (`Figuras/figuras_{sample}/CellChat/`)
+    con el prefijo `{sample}_{agrupacion}_`, así que las de BayesSpace e
+    InferCNV no se pisan entre sí.
+-   Para las 4 muestras, cambiar `sample_name` en el chunk de configuración y
+    volver a correr — no hace falta tocar nada más del script.
