@@ -425,15 +425,5 @@ write.csv(resumen, file.path(WORK_DIR, paste0(sample_name, "_summary.csv")), row
 knitr::kable(resumen)
 ```
 
-## Notas de ejecución
-
--   `CellChatDB.human` se usa fijo — cambiar a `CellChatDB.mouse` si en algún
-    momento se procesan datos de ratón.
--   Este script no genera ningún h5ad: es el último paso de la cadena, y el
-    `.rds` de cada `cellchat` (uno por agrupación) es el artefacto final,
-    guardado en `WORK_DIR`.
--   Todas las figuras se guardan en `FIG_DIR` (`Figuras/figuras_{sample}/CellChat/`)
-    con el prefijo `{sample}_{agrupacion}_`, así que las de BayesSpace e
-    InferCNV no se pisan entre sí.
 -   Para las 4 muestras, cambiar `sample_name` en el chunk de configuración y
     volver a correr — no hace falta tocar nada más del script.
